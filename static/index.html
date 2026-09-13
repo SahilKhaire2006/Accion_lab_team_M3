@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clinical Scribe - Live Recording</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 800px;
+            width: 100%;
+            padding: 40px;
+        }
+
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 40px;
+            font-size: 1.1em;
+        }
+
+        .recording-controls {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+
+        .status {
+            font-size: 1.3em;
+            font-weight: 600;
+            padding: 15px 30px;
+            border-radius: 50px;
+            background: #f0f0f0;
+            color: #666;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .status.recording {
+            background: #ff4444;
+            color: white;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        button {
+            font-size: 1.2em;
+            padding: 15px 50px;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        #startBtn {
+            background: #4CAF50;
+            color: white;
+        }
+
+        #startBtn:hover:not(:disabled) {
+            background: #45a049;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(76, 175, 80, 0.4);
+        }
+
+        #stopBtn {
+            background: #f44336;
+            color: white;
+        }
+
+        #stopBtn:hover:not(:disabled) {
+            background: #da190b;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(244, 67, 54, 0.4);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        .transcript-container {
+            background: #f9f9f9;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+
+        .transcript-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid #ddd;
+        }
+
+        .transcript-header h2 {
+            color: #333;
+            font-size: 1.8em;
+        }
+
+        .file-location {
+            background: #667eea;
+            color: white;
+            padding: 8px 15px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            font-weight: 600;
+        }
+
+        .transcript-segment {
+            background: white;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+        }
+
+        .timestamp {
+            color: #667eea;
+            font-weight: 600;
+            font-size: 0.9em;
+        }
+
+        .speaker {
+            color: #764ba2;
+            font-weight: 600;
+            margin: 5px 0;
+        }
+
+        .text {
+            color: #333;
+            line-height: 1.6;
+        }
+
+        .metadata {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .metadata-item {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .metadata-label {
+            color: #666;
+            font-size: 0.9em;
+            margin-bottom: 5px;
+        }
+
+        .metadata-value {
+            color: #333;
+            font-size: 1.3em;
+            font-weight: 600;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+        }
+
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .success-popup {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+            text-align: center;
+            z-index: 1000;
+        }
+
+        .success-popup h3 {
+            color: #4CAF50;
+            font-size: 2em;
+            margin-bottom: 15px;
+        }
+
+        .success-popup p {
+            color: #666;
+            margin-bottom: 20px;
+        }
+
+        .close-popup-btn {
+            background: #667eea;
+            color: white;
+            padding: 10px 30px;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: 600;
+        }
+
+        .overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 999;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎙️ Clinical Scribe</h1>
+        <p class="subtitle">Privacy-Preserving Live Transcription</p>
+
+        <div class="recording-controls">
+            <div id="status" class="status">
+                <span class="status-dot"></span>
+                <span id="statusText">Ready to Record</span>
+            </div>
+            
+            <button id="startBtn" onclick="startRecording()">
+                Start Conversation
+            </button>
+            
+            <button id="stopBtn" class="hidden" onclick="stopRecording()" disabled>
+                End Conversation
+            </button>
+        </div>
+
+        <div id="loading" class="loading hidden">
+            <div class="spinner"></div>
+            <p>Processing transcription... Please wait.</p>
+        </div>
+
+        <div id="transcriptContainer" class="transcript-container hidden">
+            <!-- Transcript will be displayed here -->
+        </div>
+    </div>
+
+    <script>
+        let isRecording = false;
+
+        async function startRecording() {
+            try {
+                const response = await fetch('/api/v1/live/start-recording', {
+                    method: 'POST'
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to start recording');
+                }
+
+                const data = await response.json();
+                
+                isRecording = true;
+                document.getElementById('status').classList.add('recording');
+                document.getElementById('statusText').textContent = 'Recording in Progress...';
+                document.getElementById('startBtn').classList.add('hidden');
+                document.getElementById('stopBtn').classList.remove('hidden');
+                document.getElementById('stopBtn').disabled = false;
+                document.getElementById('transcriptContainer').classList.add('hidden');
+
+            } catch (error) {
+                alert('Error starting recording: ' + error.message);
+            }
+        }
+
+        async function stopRecording() {
+            try {
+                document.getElementById('stopBtn').disabled = true;
+                document.getElementById('statusText').textContent = 'Stopping...';
+                document.getElementById('loading').classList.remove('hidden');
+
+                const response = await fetch('/api/v1/live/stop-recording', {
+                    method: 'POST'
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to stop recording');
+                }
+
+                const data = await response.json();
+                
+                isRecording = false;
+                document.getElementById('status').classList.remove('recording');
+                document.getElementById('statusText').textContent = 'Ready to Record';
+                document.getElementById('stopBtn').classList.add('hidden');
+                document.getElementById('startBtn').classList.remove('hidden');
+                document.getElementById('loading').classList.add('hidden');
+
+                // Show success popup with link to transcript viewer
+                showSuccessPopup(data.transcript.output_file, data.transcript.session_id);
+
+                // Display transcript
+                displayTranscript(data.transcript);
+
+            } catch (error) {
+                document.getElementById('loading').classList.add('hidden');
+                alert('Error stopping recording: ' + error.message);
+                location.reload();
+            }
+        }
+
+        function showSuccessPopup(filePath, sessionId) {
+            const overlay = document.createElement('div');
+            overlay.className = 'overlay';
+            
+            const popup = document.createElement('div');
+            popup.className = 'success-popup';
+            popup.innerHTML = `
+                <h3>✅ Transcription Complete!</h3>
+                <p>Your conversation has been successfully transcribed.</p>
+                <p><strong>Saved to:</strong><br>${filePath}</p>
+                <button class="close-popup-btn" onclick="viewTranscriptPage('${sessionId}')">View in Chat Format</button>
+                <button class="close-popup-btn" onclick="closePopup()" style="background: #999; margin-left: 10px;">Close</button>
+            `;
+            
+            document.body.appendChild(overlay);
+            document.body.appendChild(popup);
+
+            window.closePopup = function() {
+                overlay.remove();
+                popup.remove();
+            };
+
+            window.viewTranscriptPage = function(sessionId) {
+                window.location.href = `/transcript?session=${sessionId}`;
+            };
+        }
+
+        function displayTranscript(transcript) {
+            const container = document.getElementById('transcriptContainer');
+            container.classList.remove('hidden');
+
+            const duration = transcript.metadata.total_duration;
+            const minutes = Math.floor(duration / 60);
+            const seconds = Math.floor(duration % 60);
+
+            let html = `
+                <div class="transcript-header">
+                    <h2>📝 Transcript</h2>
+                    <div class="file-location">${transcript.output_file}</div>
+                </div>
+
+                <div class="metadata">
+                    <div class="metadata-item">
+                        <div class="metadata-label">Session ID</div>
+                        <div class="metadata-value">${transcript.session_id}</div>
+                    </div>
+                    <div class="metadata-item">
+                        <div class="metadata-label">Duration</div>
+                        <div class="metadata-value">${minutes}m ${seconds}s</div>
+                    </div>
+                    <div class="metadata-item">
+                        <div class="metadata-label">Segments</div>
+                        <div class="metadata-value">${transcript.metadata.total_segments}</div>
+                    </div>
+                </div>
+
+                <div class="segments">
+            `;
+
+            transcript.segments.forEach(segment => {
+                const startMin = Math.floor(segment.start / 60);
+                const startSec = Math.floor(segment.start % 60);
+                const endMin = Math.floor(segment.end / 60);
+                const endSec = Math.floor(segment.end % 60);
+
+                html += `
+                    <div class="transcript-segment">
+                        <div class="timestamp">${startMin}:${startSec.toString().padStart(2, '0')} - ${endMin}:${endSec.toString().padStart(2, '0')}</div>
+                        <div class="speaker">${segment.speaker}</div>
+                        <div class="text">${segment.text}</div>
+                    </div>
+                `;
+            });
+
+            html += '</div>';
+            container.innerHTML = html;
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clinical Transcript Viewer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+
+        .session-input {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .session-input input {
+            flex: 1;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+
+        .session-input input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .btn {
+            padding: 12px 30px;
+            border: none;
+            border-radius: 5px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #5568d3;
+        }
+
+        .btn-secondary {
+            background: #f39c12;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #e08e0b;
+        }
+
+        .session-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+
+        .info-item {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+        }
+
+        .info-label {
+            font-size: 12px;
+            color: #666;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+        }
+
+        .info-value {
+            font-size: 18px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .chat-container {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            padding: 30px;
+            min-height: 400px;
+        }
+
+        .message {
+            display: flex;
+            margin-bottom: 20px;
+            animation: fadeIn 0.3s;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .message.doctor {
+            justify-content: flex-start;
+        }
+
+        .message.patient {
+            justify-content: flex-end;
+        }
+
+        .message.other {
+            justify-content: flex-start;
+        }
+
+        .message-bubble {
+            max-width: 70%;
+            padding: 15px 20px;
+            border-radius: 18px;
+            position: relative;
+        }
+
+        .message.doctor .message-bubble {
+            background: #e3f2fd;
+            color: #1565c0;
+        }
+
+        .message.patient .message-bubble {
+            background: #f3e5f5;
+            color: #6a1b9a;
+        }
+
+        .message.other .message-bubble {
+            background: #fff3e0;
+            color: #e65100;
+        }
+
+        .message-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .speaker-label {
+            font-weight: 700;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .timestamp {
+            font-size: 11px;
+            opacity: 0.7;
+            font-weight: 500;
+        }
+
+        .message-text {
+            line-height: 1.6;
+            font-size: 15px;
+        }
+
+        .cleaned-badge {
+            display: inline-block;
+            background: #4caf50;
+            color: white;
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 3px;
+            margin-left: 8px;
+            font-weight: 600;
+            cursor: help;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .text-with-cleanup {
+            position: relative;
+            display: inline;
+        }
+
+        .original-text-tooltip {
+            display: none;
+            position: absolute;
+            bottom: 100%;
+            left: 0;
+            background: #333;
+            color: white;
+            padding: 10px 15px;
+            border-radius: 5px;
+            font-size: 13px;
+            white-space: normal;
+            max-width: 400px;
+            margin-bottom: 8px;
+            z-index: 1000;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+
+        .original-text-tooltip::after {
+            content: '';
+            position: absolute;
+            top: 100%;
+            left: 20px;
+            border: 6px solid transparent;
+            border-top-color: #333;
+        }
+
+        .text-with-cleanup:hover .original-text-tooltip {
+            display: block;
+        }
+
+        .tooltip-label {
+            font-size: 11px;
+            opacity: 0.8;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+        }
+
+        .error {
+            background: #ffebee;
+            color: #c62828;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            border-left: 4px solid #c62828;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #999;
+        }
+
+        .empty-state h2 {
+            margin-bottom: 10px;
+            color: #666;
+        }
+
+        #swapBtn {
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📝 Clinical Transcript Viewer</h1>
+            
+            <div class="session-input">
+                <input 
+                    type="text" 
+                    id="sessionIdInput" 
+                    placeholder="Enter Session ID (e.g., 20260908_123456)"
+                    onkeypress="if(event.key === 'Enter') loadTranscript()"
+                >
+                <button class="btn btn-primary" onclick="loadTranscript()">Load Transcript</button>
+            </div>
+
+            <div id="sessionInfo" style="display: none;">
+                <div class="session-info">
+                    <div class="info-item">
+                        <div class="info-label">Session ID</div>
+                        <div class="info-value" id="sessionId">-</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Duration</div>
+                        <div class="info-value" id="duration">-</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Segments</div>
+                        <div class="info-value" id="segmentCount">-</div>
+                    </div>
+                </div>
+                <button class="btn btn-secondary" id="swapBtn" onclick="swapRoles()">
+                    🔄 Swap Doctor/Patient
+                </button>
+            </div>
+        </div>
+
+        <div id="errorContainer"></div>
+
+        <div class="chat-container">
+            <div id="chatContent">
+                <div class="empty-state">
+                    <h2>No Transcript Loaded</h2>
+                    <p>Enter a session ID above to view the transcript</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentSessionId = null;
+
+        function formatTime(seconds) {
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.floor(seconds % 60);
+            return `${mins}:${secs.toString().padStart(2, '0')}`;
+        }
+
+        function formatDuration(seconds) {
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.floor(seconds % 60);
+            return `${mins}m ${secs}s`;
+        }
+
+        function showError(message) {
+            const errorContainer = document.getElementById('errorContainer');
+            errorContainer.innerHTML = `
+                <div class="error">
+                    <strong>Error:</strong> ${message}
+                </div>
+            `;
+            setTimeout(() => {
+                errorContainer.innerHTML = '';
+            }, 5000);
+        }
+
+        function showLoading() {
+            const chatContent = document.getElementById('chatContent');
+            chatContent.innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <p>Loading transcript...</p>
+                </div>
+            `;
+        }
+
+        async function loadTranscript() {
+            const sessionId = document.getElementById('sessionIdInput').value.trim();
+            
+            if (!sessionId) {
+                showError('Please enter a session ID');
+                return;
+            }
+
+            currentSessionId = sessionId;
+            showLoading();
+
+            try {
+                const response = await fetch(`/api/v1/live/transcript/${sessionId}`);
+                
+                if (!response.ok) {
+                    if (response.status === 404) {
+                        throw new Error('Session not found. Please check the session ID.');
+                    }
+                    throw new Error('Failed to load transcript');
+                }
+
+                const data = await response.json();
+                displayTranscript(data);
+                
+            } catch (error) {
+                showError(error.message);
+                const chatContent = document.getElementById('chatContent');
+                chatContent.innerHTML = `
+                    <div class="empty-state">
+                        <h2>Failed to Load Transcript</h2>
+                        <p>${error.message}</p>
+                    </div>
+                `;
+            }
+        }
+
+        function displayTranscript(data) {
+            // Update session info
+            document.getElementById('sessionInfo').style.display = 'block';
+            document.getElementById('sessionId').textContent = data.consultation_id || data.session_id || 'N/A';
+            document.getElementById('duration').textContent = formatDuration(data.duration);
+            document.getElementById('segmentCount').textContent = data.segments.length;
+
+            // Render messages
+            const chatContent = document.getElementById('chatContent');
+            
+            if (data.segments.length === 0) {
+                chatContent.innerHTML = `
+                    <div class="empty-state">
+                        <h2>No Segments</h2>
+                        <p>This transcript has no segments</p>
+                    </div>
+                `;
+                return;
+            }
+
+            let html = '';
+            
+            for (const segment of data.segments) {
+                // Support both old format (role) and new format (speaker)
+                const role = (segment.speaker || segment.role || 'UNKNOWN').toLowerCase();
+                const messageClass = role === 'doctor' ? 'doctor' : 
+                                    role === 'patient' ? 'patient' : 'other';
+                
+                // Support both old (start/end) and new (start_time/end_time) formats
+                const startTime = segment.start_time !== undefined ? segment.start_time : segment.start;
+                const endTime = segment.end_time !== undefined ? segment.end_time : segment.end;
+                
+                // Check if segment has cleaned text (from _internal metadata)
+                const hasCleanedText = segment._internal?.text_cleanup_applied && segment._internal?.original_text;
+                const displayText = segment.text;
+                const originalText = segment._internal?.original_text;
+                
+                let textHtml = '';
+                if (hasCleanedText) {
+                    // Show cleaned text with badge and original on hover
+                    textHtml = `
+                        <span class="text-with-cleanup">
+                            ${displayText}
+                            <span class="cleaned-badge" title="AI cleaned - hover to see original">Cleaned</span>
+                            <span class="original-text-tooltip">
+                                <div class="tooltip-label">Original Whisper Output:</div>
+                                ${originalText}
+                            </span>
+                        </span>
+                    `;
+                } else {
+                    textHtml = displayText;
+                }
+                
+                // Display role/speaker in proper case
+                const displayRole = (segment.speaker || segment.role || 'Unknown')
+                    .split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+                
+                html += `
+                    <div class="message ${messageClass}">
+                        <div class="message-bubble">
+                            <div class="message-header">
+                                <span class="speaker-label">${displayRole}</span>
+                                <span class="timestamp">${formatTime(startTime)} - ${formatTime(endTime)}</span>
+                            </div>
+                            <div class="message-text">${textHtml}</div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            chatContent.innerHTML = html;
+        }
+
+        async function swapRoles() {
+            if (!currentSessionId) {
+                showError('No transcript loaded');
+                return;
+            }
+
+            const swapBtn = document.getElementById('swapBtn');
+            swapBtn.disabled = true;
+            swapBtn.textContent = 'Swapping...';
+
+            try {
+                const response = await fetch(`/api/v1/live/swap-roles/${currentSessionId}`, {
+                    method: 'POST'
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to swap roles');
+                }
+
+                const data = await response.json();
+                displayTranscript(data);
+                
+            } catch (error) {
+                showError(error.message);
+            } finally {
+                swapBtn.disabled = false;
+                swapBtn.textContent = '🔄 Swap Doctor/Patient';
+            }
+        }
+
+        // Load session ID from URL parameter if present
+        window.addEventListener('DOMContentLoaded', () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const sessionId = urlParams.get('session');
+            if (sessionId) {
+                document.getElementById('sessionIdInput').value = sessionId;
+                loadTranscript();
+            }
+        });
+    </script>
+</body>
+</html>

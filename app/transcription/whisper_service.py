@@ -66,18 +66,19 @@ class WhisperService:
         print(f"\nTranscribing audio: {Path(audio_path).name}")
         print("This may take a moment...")
         
-        # Run transcription
+        # Run transcription with word-level timestamps
         segments, info = self.model.transcribe(
             audio_path,
             language=language,
             beam_size=5,
             vad_filter=True,  # Voice Activity Detection
-            vad_parameters=dict(min_silence_duration_ms=500)
+            vad_parameters=dict(min_silence_duration_ms=500),
+            word_timestamps=True  # Enable word-level timestamps for segment splitting
         )
         
         print(f"Detected language: {info.language} (probability: {info.language_probability:.2f})")
         
-        # Extract segments
+        # Extract segments with word-level timestamps
         transcript_segments = []
         for segment in segments:
             segment_data = {
@@ -85,6 +86,18 @@ class WhisperService:
                 "end": round(segment.end, 2),
                 "text": segment.text.strip()
             }
+            
+            # Include word-level timestamps if available
+            if hasattr(segment, 'words') and segment.words:
+                segment_data["words"] = [
+                    {
+                        "start": round(word.start, 2),
+                        "end": round(word.end, 2),
+                        "word": word.word
+                    }
+                    for word in segment.words
+                ]
+            
             transcript_segments.append(segment_data)
             print(f"  [{segment_data['start']:.2f}s - {segment_data['end']:.2f}s] {segment_data['text']}")
         
