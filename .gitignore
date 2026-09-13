@@ -17,19 +17,21 @@ ENV/
 
 # Project specific
 output/*.json
+output/*.wav
 sample_audio/*.wav
 sample_audio/*.mp3
 !sample_audio/.gitkeep
 
-# Models (cached by faster-whisper)
+# Models (cached by faster-whisper / pyannote)
 .cache/
 models/
 
 # Logs
 *.log
 
-# Environment
+# Environment variables — never commit tokens
 .env
+.env.local
 
 # OS
 .DS_Store
@@ -39,3 +41,10 @@ Thumbs.db
 temp/
 tmp/
 *.tmp
+
+# ffmpeg binaries — too large for GitHub, install separately
+ffmpeg/
+ffmpeg.zip
+
+# Kiro IDE config
+.kiro/
