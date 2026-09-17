@@ -170,7 +170,6 @@ Return ONLY the JSON object, no explanation."""
                 ],
                 temperature=0.1,
                 max_tokens=max(512, len(segments) * 12),
-                response_format={"type": "json_object"}
             )
 
             content = response.choices[0].message.content

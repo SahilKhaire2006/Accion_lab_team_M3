@@ -520,8 +520,59 @@
             if (sessionId) {
                 document.getElementById('sessionIdInput').value = sessionId;
                 loadTranscript();
+                // Poll for background diarization completion
+                startDiarizationPoller(sessionId);
             }
         });
+
+        function startDiarizationPoller(sessionId) {
+            let attempts = 0;
+            const maxAttempts = 60; // poll for up to 5 minutes
+
+            const banner = document.createElement('div');
+            banner.id = 'diarizationBanner';
+            banner.style.cssText = `
+                background: #fff3cd; color: #856404; padding: 10px 15px;
+                border-radius: 5px; margin-bottom: 15px;
+                border-left: 4px solid #ffc107; font-size: 14px;
+            `;
+            banner.innerHTML = '⏳ Improving speaker accuracy with AI diarization in background...';
+            document.querySelector('.header').appendChild(banner);
+
+            const interval = setInterval(async () => {
+                attempts++;
+                if (attempts > maxAttempts) {
+                    clearInterval(interval);
+                    banner.remove();
+                    return;
+                }
+                try {
+                    const res = await fetch(`/api/v1/live/diarization-status/${sessionId}`);
+                    const data = await res.json();
+
+                    if (data.status === 'done') {
+                        clearInterval(interval);
+                        banner.style.background = '#d4edda';
+                        banner.style.color = '#155724';
+                        banner.style.borderColor = '#28a745';
+                        banner.innerHTML = '✅ Speaker accuracy improved! Reloading transcript...';
+                        setTimeout(() => {
+                            loadTranscript();
+                            setTimeout(() => banner.remove(), 3000);
+                        }, 1000);
+                    } else if (data.status === 'failed') {
+                        clearInterval(interval);
+                        banner.style.background = '#f8d7da';
+                        banner.style.color = '#721c24';
+                        banner.style.borderColor = '#dc3545';
+                        banner.innerHTML = '⚠️ Background diarization failed — using initial speaker labels.';
+                        setTimeout(() => banner.remove(), 5000);
+                    }
+                } catch (e) {
+                    // silent — just keep polling
+                }
+            }, 5000); // poll every 5 seconds
+        }
     </script>
 </body>
 </html>

@@ -1,22 +1,23 @@
 """
 API routes for live audio recording and transcription.
 
-STREAMING PIPELINE — achieves ~2s response time after "End Conversation":
+PIPELINE OVERVIEW:
 ─────────────────────────────────────────────────────────────────────────
-  DURING recording (background, invisible to user):
-    Every CHUNK_SECONDS (5s), a background thread runs Whisper on the
-    accumulated audio so far. Results accumulate in a buffer.
+  DURING recording:
+    Every 5s → background Whisper chunk processing (text only, no speaker)
 
-  AFTER "End Conversation" click:
-    1. Flush final audio chunk through Whisper             (~1-2s)
-    2. Run diarization on full audio (parallel w/ flush)   (~4-6s)
-    3. Merge + roles + LLM                                 (~1-2s)
-    ─────────────────────────────────────────────────────────────────
-    User waits for only the LAST CHUNK + diarization, not entire audio.
+  ON "End Conversation":
+    1. Flush final Whisper chunk                (~1-3s)
+    2. Apply silence-gap speaker assignment     (~0.05s)
+    3. LLM role assignment                      (~2-5s)
+    4. Return response to user                  ← user sees result fast
 
-Model warm-up (on server start):
-    Both Whisper and pyannote are loaded once into memory at startup.
-    No per-request loading cost.
+  IN BACKGROUND (after response sent):
+    5. Run full pyannote diarization            (~60-120s on CPU)
+    6. Re-merge + re-run LLM with better labels
+    7. Update saved JSON file silently
+    8. /diarization-status/{id} endpoint tells UI when ready
+─────────────────────────────────────────────────────────────────────────
 """
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -48,40 +49,39 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SAMPLE_RATE       = 48000    # microphone capture rate
-TARGET_SR         = 16000    # Whisper expects 16kHz
-CHUNK_SECONDS     = 5        # process a Whisper chunk every N seconds of audio
-CHANNELS          = 2        # stereo mic → will be converted to mono
+SAMPLE_RATE   = 48000
+TARGET_SR     = 16000
+CHUNK_SECONDS = 5
+CHANNELS      = 2
 
 # ---------------------------------------------------------------------------
-# Module-level singletons & shared state
+# Singletons & shared state
 # ---------------------------------------------------------------------------
-_executor = ThreadPoolExecutor(max_workers=3)
+_executor = ThreadPoolExecutor(max_workers=4)
 
-# Recording state
 recording_state = {
-    "is_recording":       False,
-    "audio_queue":        None,
-    "stream":             None,
-    # Streaming pipeline state
-    "all_audio_chunks":   [],        # every raw chunk since start-recording
-    "processed_audio":    None,      # preprocessed float32 mono 16kHz array
-    "whisper_segments":   [],        # segments produced by background Whisper runs
-    "chunk_lock":         threading.Lock(),
-    "bg_whisper_future":  None,
-    "total_processed_samples": 0,   # how many 16kHz samples already Whisper-processed
+    "is_recording":            False,
+    "audio_queue":             None,
+    "stream":                  None,
+    "all_audio_chunks":        [],
+    "whisper_segments":        [],
+    "chunk_lock":              threading.Lock(),
+    "total_processed_samples": 0,
 }
 
-# Pre-loaded service (singleton, warm at startup)
-_whisper_service  = None
-_preprocessor     = AudioPreprocessor()
+# Background diarization status per session
+# {session_id: "pending" | "running" | "done" | "failed"}
+_diarization_status: Dict[str, str] = {}
+
+_whisper_service = None
+_preprocessor    = AudioPreprocessor()
 
 
 def get_whisper_service() -> WhisperService:
     global _whisper_service
     if _whisper_service is None:
         _whisper_service = WhisperService(model_name="base.en")
-        _whisper_service.load_model()   # loads singleton — instant after first call
+        _whisper_service.load_model()
     return _whisper_service
 
 
@@ -96,56 +96,37 @@ def audio_callback(indata, frames, time_info, status):
 
 
 # ---------------------------------------------------------------------------
-# Background Whisper chunk processor
+# Background Whisper chunk processor (runs every CHUNK_SECONDS)
 # ---------------------------------------------------------------------------
 def _process_new_audio_chunk():
-    """
-    Called in a background thread every CHUNK_SECONDS.
-    Drains the audio queue, preprocesses, runs Whisper on the NEW audio only,
-    and appends results to recording_state["whisper_segments"].
-    """
     with recording_state["chunk_lock"]:
-        # Drain queue into all_audio_chunks
         new_raw = []
         q = recording_state["audio_queue"]
         while q and not q.empty():
             new_raw.append(q.get_nowait())
-
         if not new_raw:
             return
 
         recording_state["all_audio_chunks"].extend(new_raw)
-
-        # Build full raw audio and preprocess to 16kHz mono float32
         full_raw = np.concatenate(recording_state["all_audio_chunks"], axis=0)
         full_processed = _preprocessor.preprocess(full_raw, SAMPLE_RATE)
 
-        # Only transcribe the NEW portion (not already processed)
         already = recording_state["total_processed_samples"]
         new_audio = full_processed[already:]
-
-        if len(new_audio) < TARGET_SR * 1:   # skip if less than 1 second
+        if len(new_audio) < TARGET_SR * 1:
             return
 
-        offset = already / TARGET_SR          # time offset in seconds
-
-        # Run Whisper on just the new chunk
+        offset = already / TARGET_SR
         ws = get_whisper_service()
         new_segs = ws.transcribe_chunk(new_audio, offset_seconds=offset)
 
         recording_state["whisper_segments"].extend(new_segs)
         recording_state["total_processed_samples"] = len(full_processed)
-        recording_state["processed_audio"] = full_processed
-
-        print(f"  [BG Whisper] chunk @{offset:.1f}s → {len(new_segs)} new segments "
-              f"(total {len(recording_state['whisper_segments'])})")
+        print(f"  [BG Whisper] chunk @{offset:.1f}s → "
+              f"{len(new_segs)} new segs (total {len(recording_state['whisper_segments'])})")
 
 
-# ---------------------------------------------------------------------------
-# Chunk scheduler — fires every CHUNK_SECONDS while recording
-# ---------------------------------------------------------------------------
 def _chunk_scheduler():
-    """Runs in a daemon thread while recording is active."""
     while recording_state["is_recording"]:
         time.sleep(CHUNK_SECONDS)
         if recording_state["is_recording"]:
@@ -156,29 +137,140 @@ def _chunk_scheduler():
 
 
 # ---------------------------------------------------------------------------
+# Speaker heuristics
+# ---------------------------------------------------------------------------
+def _silence_gap_speakers(segments: List[Dict], gap_threshold: float = 0.35) -> List[Dict]:
+    """
+    Assign speaker labels by detecting pauses between segments.
+    A gap >= gap_threshold seconds → speaker changed.
+    """
+    if not segments:
+        return segments
+
+    result = []
+    current_speaker = "SPEAKER_00"
+    prev_end = segments[0]["end"]
+
+    for i, seg in enumerate(segments):
+        if i > 0:
+            gap = seg["start"] - prev_end
+            if gap >= gap_threshold:
+                current_speaker = ("SPEAKER_01"
+                                   if current_speaker == "SPEAKER_00"
+                                   else "SPEAKER_00")
+        result.append({**seg, "speaker": current_speaker})
+        prev_end = seg["end"]
+
+    speakers = set(s["speaker"] for s in result)
+    print(f"  Silence-gap: {len(result)} segments, "
+          f"{len(speakers)} speaker(s) detected")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Background diarization updater
+# ---------------------------------------------------------------------------
+def _background_diarize_and_update(session_id: str,
+                                    temp_path: str,
+                                    whisper_segments: List[Dict]):
+    """
+    Runs AFTER the HTTP response is already sent.
+    Re-runs pyannote diarization, re-merges, re-runs LLM, overwrites JSON.
+    Updates _diarization_status[session_id] throughout.
+    """
+    output_path = Path("output") / f"session_{session_id}.json"
+    _diarization_status[session_id] = "running"
+    print(f"\n  [BG Diarization] Starting for session {session_id}...")
+
+    try:
+        t0 = time.time()
+
+        # Run full pyannote diarization (no time limit here — runs in bg)
+        diarization_turns = diarize(temp_path, min_speakers=2, max_speakers=2)
+
+        if not diarization_turns:
+            print(f"  [BG Diarization] No turns returned, keeping silence-gap result")
+            _diarization_status[session_id] = "failed"
+            return
+
+        elapsed_dia = time.time() - t0
+        print(f"  [BG Diarization] Diarization done in {elapsed_dia:.1f}s")
+
+        # Merge with proper diarization
+        merged = merge_transcript_with_speakers(whisper_segments, diarization_turns)
+        final_segments = label_roles(merged, first_speaker_is="Doctor")
+
+        # Re-run LLM with properly diarized segments
+        print("  [BG Diarization] Running LLM role refinement...")
+        final_segments = refine_roles_with_llm(final_segments)
+
+        # Load existing JSON, replace only segments and metadata
+        if output_path.exists():
+            with open(output_path, "r", encoding="utf-8") as f:
+                session_data = json.load(f)
+        else:
+            print(f"  [BG Diarization] Session file not found: {output_path}")
+            _diarization_status[session_id] = "failed"
+            return
+
+        # Rebuild segments in Team B format
+        team_b_segments = []
+        for seg in final_segments:
+            team_b_seg = {
+                "speaker":    seg["role"].upper(),
+                "start_time": seg["start"],
+                "end_time":   seg["end"],
+                "text":       seg.get("text_cleaned", seg["text"]),
+                "confidence": 0.95,
+            }
+            team_b_seg["_internal"] = {
+                "original_speaker":     seg["speaker"],
+                "role_source":          seg["role_source"],
+                "original_text":        seg["text"] if seg.get("text_cleaned") else None,
+                "text_cleanup_applied": seg.get("text_cleanup_applied", False),
+            }
+            team_b_segments.append(team_b_seg)
+
+        session_data["segments"] = team_b_segments
+        session_data["metadata"]["diarization_status"] = "enabled"
+        session_data["metadata"]["total_segments"] = len(team_b_segments)
+        session_data["metadata"]["bg_diarization_time"] = round(time.time() - t0, 1)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(session_data, f, indent=2, ensure_ascii=False)
+
+        total = time.time() - t0
+        print(f"  [BG Diarization] ✓ Session updated in {total:.1f}s — "
+              f"{len(team_b_segments)} segments")
+
+        _diarization_status[session_id] = "done"
+
+    except Exception as e:
+        print(f"  [BG Diarization] ✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        _diarization_status[session_id] = "failed"
+
+
+# ---------------------------------------------------------------------------
 # API endpoints
 # ---------------------------------------------------------------------------
 
 @router.post("/start-recording")
 async def start_recording():
-    """Start live audio recording and background streaming transcription."""
     global recording_state
 
     if recording_state["is_recording"]:
         raise HTTPException(status_code=400, detail="Recording already in progress")
 
-    # Reset state
     recording_state.update({
         "is_recording":            True,
         "audio_queue":             queue.Queue(),
         "all_audio_chunks":        [],
         "whisper_segments":        [],
         "total_processed_samples": 0,
-        "processed_audio":         None,
-        "bg_whisper_future":       None,
     })
 
-    # Ensure Whisper is warm before recording starts
     _executor.submit(get_whisper_service)
 
     device_info = sd.query_devices(kind='input')
@@ -192,9 +284,7 @@ async def start_recording():
     )
     recording_state["stream"].start()
 
-    # Start background chunk scheduler
-    scheduler = threading.Thread(target=_chunk_scheduler, daemon=True)
-    scheduler.start()
+    threading.Thread(target=_chunk_scheduler, daemon=True).start()
 
     return JSONResponse(content={
         "status":      "recording_started",
@@ -206,24 +296,15 @@ async def start_recording():
 
 @router.post("/stop-recording")
 async def stop_recording(background_tasks: BackgroundTasks):
-    """
-    Stop recording and complete the transcript.
-    Background Whisper has been running during recording — only the final
-    chunk + diarization needs to finish now, giving ~2-4s response time.
-    """
     global recording_state
 
     if not recording_state["is_recording"]:
         raise HTTPException(status_code=400, detail="No recording in progress")
 
-    stop_time = time.time()
-
-    # Stop mic stream
     recording_state["stream"].stop()
     recording_state["stream"].close()
-    recording_state["is_recording"] = False   # also stops chunk scheduler
+    recording_state["is_recording"] = False
 
-    # Drain any remaining audio from queue
     remaining = []
     q = recording_state["audio_queue"]
     while not q.empty():
@@ -234,7 +315,6 @@ async def stop_recording(background_tasks: BackgroundTasks):
     if not recording_state["all_audio_chunks"]:
         raise HTTPException(status_code=400, detail="No audio data recorded")
 
-    # Save raw audio
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     audio_dir = Path("sample_audio")
     audio_dir.mkdir(exist_ok=True)
@@ -243,186 +323,103 @@ async def stop_recording(background_tasks: BackgroundTasks):
     sf.write(str(audio_path), full_raw, SAMPLE_RATE)
 
     transcript_result = await _finalize_transcript(
-        full_raw, str(audio_path), timestamp, stop_time
+        full_raw, str(audio_path), timestamp, background_tasks
     )
 
     return JSONResponse(content={
-        "status":       "recording_stopped",
-        "message":      "Recording stopped and transcription complete",
-        "audio_file":   str(audio_path),
-        "duration":     len(full_raw) / SAMPLE_RATE,
-        "transcript":   transcript_result,
+        "status":     "recording_stopped",
+        "message":    "Recording stopped and transcription complete",
+        "audio_file": str(audio_path),
+        "duration":   len(full_raw) / SAMPLE_RATE,
+        "transcript": transcript_result,
     })
 
 
 # ---------------------------------------------------------------------------
-# Silence-gap speaker heuristic (used when diarization is skipped)
-# ---------------------------------------------------------------------------
-
-def _silence_gap_speakers(segments: List[Dict], gap_threshold: float = 0.4) -> List[Dict]:
-    """
-    Assign speaker labels based on silence gaps between segments.
-    A gap > gap_threshold seconds triggers a speaker change.
-    Speaker labels: SPEAKER_00, SPEAKER_01 (alternating on each gap).
-    """
-    if not segments:
-        return segments
-
-    result = []
-    current_speaker = "SPEAKER_00"
-    prev_end = segments[0]["end"]
-
-    for i, seg in enumerate(segments):
-        if i > 0:
-            gap = seg["start"] - prev_end
-            if gap >= gap_threshold:
-                # Switch speaker on silence gap
-                current_speaker = "SPEAKER_01" if current_speaker == "SPEAKER_00" else "SPEAKER_00"
-        result.append({**seg, "speaker": current_speaker})
-        prev_end = seg["end"]
-
-    speakers = set(s["speaker"] for s in result)
-    print(f"  Silence-gap: {len(result)} segments, {len(speakers)} speaker(s) detected")
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Finalisation — runs after stop-recording
+# Finalisation
 # ---------------------------------------------------------------------------
 
 async def _finalize_transcript(full_raw: np.ndarray,
                                 audio_path: str,
                                 session_id: str,
-                                stop_time: float):
-    """
-    Complete the transcript after recording ends.
-
-    Work breakdown:
-      A) Flush final unprocessed audio through Whisper   (thread 1)
-      B) Run diarization on full audio                   (thread 2)
-      Both run in parallel, then merge/roles/LLM.
-    """
+                                background_tasks: BackgroundTasks):
     t_start = time.time()
     os.makedirs("output", exist_ok=True)
 
     print("\n" + "="*70)
-    print("FINALISING TRANSCRIPT  [streaming pipeline]")
+    print("FINALISING TRANSCRIPT  [streaming + bg-diarization pipeline]")
     print("="*70)
 
-    # ------------------------------------------------------------------
-    # Preprocess full audio (fast — ~0.1s)
-    # ------------------------------------------------------------------
+    # Preprocess
     full_processed = _preprocessor.preprocess(full_raw, SAMPLE_RATE)
     temp_path = "output/temp_live_processed.wav"
     sf.write(temp_path, full_processed, TARGET_SR)
 
     already_processed = recording_state["total_processed_samples"]
-    bg_segments       = list(recording_state["whisper_segments"])   # copy
+    bg_segments       = list(recording_state["whisper_segments"])
 
-    print(f"\n  Background already transcribed: "
-          f"{already_processed/TARGET_SR:.1f}s "
+    print(f"\n  Background transcribed: {already_processed/TARGET_SR:.1f}s "
           f"({len(bg_segments)} segments)")
 
     # ------------------------------------------------------------------
-    # PARALLEL: flush final chunk (Whisper) + full diarization
+    # Flush final Whisper chunk
     # ------------------------------------------------------------------
-    print("\n  Running final Whisper flush + Diarization in PARALLEL...")
-    t_parallel = time.time()
-
-    def _flush_final():
-        """Whisper only on the unprocessed tail."""
-        remaining_audio = full_processed[already_processed:]
-        if len(remaining_audio) < TARGET_SR * 0.5:   # < 0.5s — nothing to do
-            print("  [Flush] No remaining audio to flush")
-            return []
+    print("\n  Flushing final audio chunk through Whisper...")
+    t_flush = time.time()
+    remaining_audio = full_processed[already_processed:]
+    final_new_segs = []
+    if len(remaining_audio) >= TARGET_SR * 0.5:
         offset = already_processed / TARGET_SR
         ws = get_whisper_service()
-        segs = ws.transcribe_chunk(remaining_audio, offset_seconds=offset)
-        print(f"  [Flush] {len(segs)} new segments from final chunk")
-        return segs
-
-    def _run_diarization():
-        # Skip diarization for audio > 120s on CPU — would take too long
-        # Silence-gap heuristic + LLM correction is used instead
-        audio_duration = len(full_processed) / TARGET_SR
-        if audio_duration > 120:
-            print(f"  [Diarization] Audio is {audio_duration:.0f}s — "
-                  f"skipping pyannote on CPU (>120s limit), using silence-gap heuristic")
-            return [], "skipped_long_audio"
-        try:
-            turns = diarize(temp_path, min_speakers=2, max_speakers=2)
-            if not turns:
-                return [], "failed"
-            return turns, "enabled"
-        except Exception as e:
-            print(f"  [Diarization] Error: {e}")
-            return [], "failed"
-
-    future_flush  = _executor.submit(_flush_final)
-    future_diariz = _executor.submit(_run_diarization)
-
-    final_new_segs              = future_flush.result()
-    diarization_turns, dia_status = future_diariz.result()
-
-    parallel_elapsed = time.time() - t_parallel
-    print(f"\n  ✓ Parallel flush+diarization done in {parallel_elapsed:.2f}s")
+        final_new_segs = ws.transcribe_chunk(remaining_audio, offset_seconds=offset)
+        print(f"  [Flush] {len(final_new_segs)} new segments in "
+              f"{time.time()-t_flush:.2f}s")
+    else:
+        print("  [Flush] No remaining audio")
 
     # ------------------------------------------------------------------
-    # Combine all Whisper segments and deduplicate
+    # Deduplicate all Whisper segments
     # ------------------------------------------------------------------
-    all_segments = bg_segments + final_new_segs
-
-    # Deduplicate: remove segments with duplicate (start, end) pairs
+    all_segs = bg_segments + final_new_segs
     seen = set()
     whisper_segments = []
-    for s in sorted(all_segments, key=lambda x: x["start"]):
+    for s in sorted(all_segs, key=lambda x: x["start"]):
         key = (s["start"], s["end"])
         if key not in seen:
             seen.add(key)
             whisper_segments.append(s)
+    print(f"\n  Total Whisper segments: {len(whisper_segments)}")
 
-    print(f"\n  Total Whisper segments after dedup: {len(whisper_segments)}")
-
-    # ------------------------------------------------------------------
-    # Garbled text cleanup (fast, only on flagged segments)
-    # ------------------------------------------------------------------
+    # Garbled text cleanup
     whisper_segments = detect_garbled_segments(whisper_segments)
     if any(seg.get("likely_garbled") for seg in whisper_segments):
         whisper_segments = cleanup_garbled_segments(whisper_segments)
 
     # ------------------------------------------------------------------
-    # Merge → Roles → LLM
+    # Quick speaker assignment (silence-gap) for immediate response
     # ------------------------------------------------------------------
-    print("\n  Merging speaker labels...")
-
-    if diarization_turns:
-        # Full pyannote diarization available
-        merged = merge_transcript_with_speakers(whisper_segments, diarization_turns)
-    else:
-        # No diarization — use silence-gap heuristic
-        # Assign speakers based on pauses: gap > 400ms = speaker change
-        print("  Using silence-gap heuristic for speaker assignment...")
-        merged = _silence_gap_speakers(whisper_segments, gap_threshold=0.4)
-
-    print("\n  Mapping speakers to roles...")
+    print("\n  Applying silence-gap speaker assignment...")
+    merged = _silence_gap_speakers(whisper_segments, gap_threshold=0.35)
     final_segments = label_roles(merged, first_speaker_is="Doctor")
 
+    # ------------------------------------------------------------------
+    # LLM role refinement
+    # ------------------------------------------------------------------
     print("\n  LLM role refinement...")
     t_llm = time.time()
     final_segments = refine_roles_with_llm(final_segments)
     print(f"  ✓ LLM done in {time.time()-t_llm:.2f}s")
 
+    role_counts = {}
+    for seg in final_segments:
+        role_counts[seg["role"]] = role_counts.get(seg["role"], 0) + 1
+    print(f"  ✓ Role distribution: {role_counts}")
+
     # ------------------------------------------------------------------
-    # Build + save session JSON
+    # Build + save initial session JSON
     # ------------------------------------------------------------------
     duration      = final_segments[-1]["end"] if final_segments else 0.0
     total_elapsed = time.time() - t_start
-
-    role_counts = {}
-    for seg in final_segments:
-        r = seg["role"]
-        role_counts[r] = role_counts.get(r, 0) + 1
-    print(f"  ✓ Role distribution: {role_counts}")
 
     team_b_segments = []
     for seg in final_segments:
@@ -450,11 +447,11 @@ async def _finalize_transcript(full_raw: np.ndarray,
         "metadata": {
             "total_segments":          len(team_b_segments),
             "total_duration":          duration,
-            "diarization_status":      dia_status,
+            "diarization_status":      "pending_background",
             "model":                   "whisper-local-base.en",
             "format_version":          "team_b_compatible_v1",
             "processing_time_seconds": round(total_elapsed, 2),
-            "pipeline":                "streaming",
+            "pipeline":                "streaming+bg-diarization",
         },
     }
 
@@ -462,16 +459,32 @@ async def _finalize_transcript(full_raw: np.ndarray,
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(session_data, f, indent=2, ensure_ascii=False)
 
-    print(f"\n✓ Session saved: {output_path}")
-    print(f"✓ POST-STOP PROCESSING TIME: {total_elapsed:.2f}s  "
-          f"(audio: {duration:.1f}s)")
+    print(f"\n✓ Initial session saved: {output_path}")
+    print(f"✓ RESPONSE TIME: {total_elapsed:.2f}s  (audio: {duration:.1f}s)")
+    print("  → Launching background diarization to improve accuracy...")
     print("="*70 + "\n")
+
+    # ------------------------------------------------------------------
+    # Schedule background diarization (runs AFTER response is returned)
+    # ------------------------------------------------------------------
+    _diarization_status[session_id] = "pending"
+
+    # Copy whisper_segments for background thread (immutable snapshot)
+    ws_snapshot = [dict(s) for s in whisper_segments]
+    temp_path_copy = temp_path  # already saved to disk
+
+    background_tasks.add_task(
+        _background_diarize_and_update,
+        session_id,
+        temp_path_copy,
+        ws_snapshot,
+    )
 
     return {**session_data, "output_file": str(output_path)}
 
 
 # ---------------------------------------------------------------------------
-# Remaining endpoints (unchanged)
+# Remaining endpoints
 # ---------------------------------------------------------------------------
 
 @router.get("/transcript/{session_id}")
@@ -482,6 +495,27 @@ async def get_transcript(session_id: str):
                             detail=f"Session not found: {session_id}")
     with open(output_path, "r", encoding="utf-8") as f:
         return JSONResponse(content=json.load(f))
+
+
+@router.get("/diarization-status/{session_id}")
+async def get_diarization_status(session_id: str):
+    """
+    Poll this endpoint to know when background diarization is complete.
+    Returns: pending | running | done | failed | unknown
+    Frontend can auto-refresh the transcript when status == 'done'.
+    """
+    status = _diarization_status.get(session_id, "unknown")
+    return JSONResponse(content={
+        "session_id": session_id,
+        "status":     status,
+        "message": {
+            "pending":  "Diarization queued, will start shortly",
+            "running":  "Diarization in progress, transcript will auto-update",
+            "done":     "Diarization complete, reload transcript for accurate speakers",
+            "failed":   "Diarization failed, silence-gap labels remain",
+            "unknown":  "Session not found in diarization queue",
+        }.get(status, status)
+    })
 
 
 @router.post("/swap-roles/{session_id}")
@@ -505,9 +539,7 @@ async def swap_roles(session_id: str):
 
 @router.get("/recording-status")
 async def get_recording_status():
-    return JSONResponse(content={
-        "is_recording": recording_state["is_recording"]
-    })
+    return JSONResponse(content={"is_recording": recording_state["is_recording"]})
 
 
 @router.get("/team-b/consultation/{consultation_id}")
