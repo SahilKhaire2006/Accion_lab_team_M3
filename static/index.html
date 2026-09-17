@@ -345,7 +345,7 @@
                 }
 
                 const data = await response.json();
-                
+
                 isRecording = false;
                 document.getElementById('status').classList.remove('recording');
                 document.getElementById('statusText').textContent = 'Ready to Record';
@@ -353,14 +353,15 @@
                 document.getElementById('startBtn').classList.remove('hidden');
                 document.getElementById('loading').classList.add('hidden');
 
-                // consultation_id is the session identifier in the new format
-                const sessionId = data.transcript.consultation_id || data.transcript.session_id;
+                // Extract session ID — new format uses consultation_id
+                const transcript = data.transcript;
+                const sessionId = transcript.consultation_id || transcript.session_id || '';
 
-                // Show success popup with link to transcript viewer
-                showSuccessPopup(data.transcript.output_file, sessionId);
+                // Show success popup
+                showSuccessPopup(transcript.output_file || '', sessionId);
 
-                // Display transcript
-                displayTranscript(data.transcript);
+                // Display inline transcript
+                displayTranscript(transcript);
 
             } catch (error) {
                 document.getElementById('loading').classList.add('hidden');

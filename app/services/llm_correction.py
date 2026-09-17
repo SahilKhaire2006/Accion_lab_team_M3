@@ -14,13 +14,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Fast, reliable models — ordered by preference
-# llama3-70b handles 8k context and returns clean JSON reliably
-_PRIMARY_MODEL   = "llama3-70b-8192"
-_FALLBACK_MODELS = ["llama3-8b-8192", "mixtral-8x7b-32768"]
+# Fast, reliable models currently available on Groq — ordered by preference
+_PRIMARY_MODEL   = "openai/gpt-oss-20b"
+_FALLBACK_MODELS = ["openai/gpt-oss-120b", "groq/compound-mini", "groq/compound"]
 
 # Max segments to send in one LLM call — beyond this we sample
-_MAX_SEGMENTS_PER_CALL = 30
+# gpt-oss-20b handles ~20 segments reliably without hitting token limits
+_MAX_SEGMENTS_PER_CALL = 20
 
 
 def refine_roles_with_llm(segments: List[Dict]) -> List[Dict]:
