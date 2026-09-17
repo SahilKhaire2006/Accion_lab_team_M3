@@ -1,5 +1,8 @@
 """
 Real speaker diarization using pyannote.audio.
+
+Singleton pattern: pipeline is loaded ONCE at startup and reused —
+eliminates the per-request 5-10s model load cost.
 """
 import os
 import time
@@ -14,6 +17,11 @@ load_dotenv()
 # Global pipeline cache
 _pipeline = None
 _pipeline_load_time = None
+
+
+def warmup_diarization():
+    """Pre-load the diarization pipeline at server startup."""
+    get_diarization_pipeline()
 
 
 def get_diarization_pipeline():

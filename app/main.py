@@ -9,6 +9,8 @@ from pathlib import Path
 from app.api.routes import router
 from app.api.live_routes import router as live_router
 from app.services.llm_correction import validate_groq_config
+from app.transcription.whisper_service import warmup_whisper
+from app.services.diarization import warmup_diarization
 
 # Create FastAPI app
 app = FastAPI(
@@ -38,11 +40,31 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.on_event("startup")
 async def startup_event():
-    """Run startup checks."""
-    # Validate Groq configuration
+    """
+    Pre-warm all models at startup so the first request is fast.
+    Both models load in background threads — server is ready immediately
+    but models will be hot by the time the first recording starts.
+    """
+    import threading
+
     groq_warning = validate_groq_config()
     if groq_warning:
         print(groq_warning)
+
+    # Pre-load Whisper in background (takes 3-5s, non-blocking)
+    def _warm_whisper():
+        print("[Startup] Pre-loading Whisper model...")
+        warmup_whisper("base.en")
+        print("[Startup] ✓ Whisper model ready")
+
+    # Pre-load pyannote in background (takes 5-15s, non-blocking)
+    def _warm_diarization():
+        print("[Startup] Pre-loading Diarization pipeline...")
+        warmup_diarization()
+        print("[Startup] ✓ Diarization pipeline ready")
+
+    threading.Thread(target=_warm_whisper,     daemon=True).start()
+    threading.Thread(target=_warm_diarization, daemon=True).start()
 
 
 @app.get("/", response_class=HTMLResponse)
