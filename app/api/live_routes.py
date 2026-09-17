@@ -31,6 +31,7 @@ import threading
 from pathlib import Path
 import queue
 from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict
 
 from app.audio.audio_loader import AudioLoader
 from app.audio.preprocessing import AudioPreprocessor
@@ -255,6 +256,37 @@ async def stop_recording(background_tasks: BackgroundTasks):
 
 
 # ---------------------------------------------------------------------------
+# Silence-gap speaker heuristic (used when diarization is skipped)
+# ---------------------------------------------------------------------------
+
+def _silence_gap_speakers(segments: List[Dict], gap_threshold: float = 0.4) -> List[Dict]:
+    """
+    Assign speaker labels based on silence gaps between segments.
+    A gap > gap_threshold seconds triggers a speaker change.
+    Speaker labels: SPEAKER_00, SPEAKER_01 (alternating on each gap).
+    """
+    if not segments:
+        return segments
+
+    result = []
+    current_speaker = "SPEAKER_00"
+    prev_end = segments[0]["end"]
+
+    for i, seg in enumerate(segments):
+        if i > 0:
+            gap = seg["start"] - prev_end
+            if gap >= gap_threshold:
+                # Switch speaker on silence gap
+                current_speaker = "SPEAKER_01" if current_speaker == "SPEAKER_00" else "SPEAKER_00"
+        result.append({**seg, "speaker": current_speaker})
+        prev_end = seg["end"]
+
+    speakers = set(s["speaker"] for s in result)
+    print(f"  Silence-gap: {len(result)} segments, {len(speakers)} speaker(s) detected")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Finalisation — runs after stop-recording
 # ---------------------------------------------------------------------------
 
@@ -310,6 +342,13 @@ async def _finalize_transcript(full_raw: np.ndarray,
         return segs
 
     def _run_diarization():
+        # Skip diarization for audio > 120s on CPU — would take too long
+        # Silence-gap heuristic + LLM correction is used instead
+        audio_duration = len(full_processed) / TARGET_SR
+        if audio_duration > 120:
+            print(f"  [Diarization] Audio is {audio_duration:.0f}s — "
+                  f"skipping pyannote on CPU (>120s limit), using silence-gap heuristic")
+            return [], "skipped_long_audio"
         try:
             turns = diarize(temp_path, min_speakers=2, max_speakers=2)
             if not turns:
@@ -355,7 +394,15 @@ async def _finalize_transcript(full_raw: np.ndarray,
     # Merge → Roles → LLM
     # ------------------------------------------------------------------
     print("\n  Merging speaker labels...")
-    merged = merge_transcript_with_speakers(whisper_segments, diarization_turns)
+
+    if diarization_turns:
+        # Full pyannote diarization available
+        merged = merge_transcript_with_speakers(whisper_segments, diarization_turns)
+    else:
+        # No diarization — use silence-gap heuristic
+        # Assign speakers based on pauses: gap > 400ms = speaker change
+        print("  Using silence-gap heuristic for speaker assignment...")
+        merged = _silence_gap_speakers(whisper_segments, gap_threshold=0.4)
 
     print("\n  Mapping speakers to roles...")
     final_segments = label_roles(merged, first_speaker_is="Doctor")

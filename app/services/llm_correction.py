@@ -1,5 +1,11 @@
 """
-LLM-based role refinement using Groq (mandatory quality assurance step).
+LLM-based role refinement using Groq.
+
+Key fixes vs previous version:
+- Primary model changed to llama3-70b-8192 (fast, handles large context, no JSON issues)
+- Large transcripts (>30 segments) are sampled: send representative 30 segments,
+  infer the rest from alternating pattern — avoids token limit failures
+- Fallback chain updated to reliable models only
 """
 import os
 import json
@@ -8,275 +14,241 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Fast, reliable models — ordered by preference
+# llama3-70b handles 8k context and returns clean JSON reliably
+_PRIMARY_MODEL   = "llama3-70b-8192"
+_FALLBACK_MODELS = ["llama3-8b-8192", "mixtral-8x7b-32768"]
+
+# Max segments to send in one LLM call — beyond this we sample
+_MAX_SEGMENTS_PER_CALL = 30
+
 
 def refine_roles_with_llm(segments: List[Dict]) -> List[Dict]:
     """
-    Send all segments to Groq LLM for role refinement and error correction.
-    This is a mandatory quality assurance step that runs after diarization.
-    
-    Args:
-        segments: List of segments with 'start', 'end', 'text', 'speaker', 'role' fields
-        
-    Returns:
-        List of segments with LLM-refined roles
+    Refine Doctor/Patient role assignments using Groq LLM.
+    For large transcripts, samples key segments and infers the rest.
     """
     if not segments:
         return segments
-    
-    print("  Sending transcript to Groq LLM for role refinement...")
-    
+
+    print(f"  Sending {len(segments)} segments to Groq LLM for role refinement...")
+
     try:
-        refined_roles = call_groq_for_refinement(segments)
-        
+        if len(segments) <= _MAX_SEGMENTS_PER_CALL:
+            # Small transcript — send everything
+            refined_roles = _call_groq(segments)
+        else:
+            # Large transcript — sample intelligently
+            refined_roles = _call_groq_sampled(segments)
+
         if not refined_roles or len(refined_roles) != len(segments):
-            print("  ⚠️  LLM refinement failed, keeping original roles")
+            print("  ⚠️  LLM refinement failed, keeping diarization roles")
             for seg in segments:
                 seg["role_source"] = "diarization_only"
             return segments
-        
-        # Apply LLM-refined roles
-        changes_made = 0
+
+        changes = 0
         for i, seg in enumerate(segments):
-            original_role = seg["role"]
-            refined_role = refined_roles[i]
-            
-            if original_role != refined_role:
-                changes_made += 1
-                seg["role"] = refined_role
+            if seg["role"] != refined_roles[i]:
+                seg["role"] = refined_roles[i]
                 seg["role_source"] = "llm_corrected"
+                changes += 1
             else:
                 seg["role_source"] = "llm_confirmed"
-        
-        print(f"  ✓ LLM refined roles: {changes_made} change(s), {len(segments) - changes_made} confirmed")
+
+        print(f"  ✓ LLM refined: {changes} change(s), {len(segments)-changes} confirmed")
         return segments
-        
+
     except Exception as e:
         print(f"  ⚠️  LLM refinement error: {e}")
-        # Keep original roles on error
         for seg in segments:
             seg["role_source"] = "diarization_only"
         return segments
 
 
-def call_groq_for_refinement(segments: List[Dict]) -> List[str]:
+def _call_groq_sampled(segments: List[Dict]) -> List[str]:
     """
-    Call Groq API to refine and correct role assignments.
-    
-    Args:
-        segments: List of segments with text, speaker, and current role
-        
-    Returns:
-        List of refined roles (one per segment, in order)
+    For large transcripts: send first 15 + last 15 segments to establish
+    the role pattern, then apply that pattern to all segments.
+    """
+    n = len(segments)
+    half = _MAX_SEGMENTS_PER_CALL // 2
+
+    # Take first half + last half as representative sample
+    sample_indices = list(range(half)) + list(range(n - half, n))
+    sample_segs = [segments[i] for i in sample_indices]
+
+    print(f"  [LLM] Large transcript ({n} segs) — sampling {len(sample_segs)} representative segments")
+
+    sample_roles = _call_groq(sample_segs)
+    if not sample_roles or len(sample_roles) != len(sample_segs):
+        return []
+
+    # Map sample indices back to their roles
+    sample_role_map = {sample_indices[i]: sample_roles[i] for i in range(len(sample_indices))}
+
+    # Determine dominant pattern from sample
+    # Find the role of SPEAKER_00 equivalent from first few segments
+    first_role = sample_roles[0]  # role of segment 0
+    second_role = "Patient" if first_role == "Doctor" else "Doctor"
+
+    # Build full roles list using LLM results for sampled segments,
+    # and alternating heuristic based on speaker changes for the rest
+    full_roles = []
+    prev_speaker = None
+    current_role = first_role
+
+    for i, seg in enumerate(segments):
+        if i in sample_role_map:
+            # Use LLM result directly
+            full_roles.append(sample_role_map[i])
+            current_role = sample_role_map[i]
+            prev_speaker = seg.get("speaker", "UNKNOWN")
+        else:
+            # Infer from speaker change pattern
+            this_speaker = seg.get("speaker", "UNKNOWN")
+            if this_speaker != prev_speaker and this_speaker != "UNKNOWN":
+                current_role = "Patient" if current_role == "Doctor" else "Doctor"
+            full_roles.append(current_role)
+            prev_speaker = this_speaker
+
+    return full_roles
+
+
+def _call_groq(segments: List[Dict]) -> List[str]:
+    """
+    Call Groq API with a list of segments (max _MAX_SEGMENTS_PER_CALL).
+    Returns list of role strings or empty list on failure.
     """
     try:
         from groq import Groq
     except ImportError:
         print("  ⚠️  groq package not installed")
         return []
-    
-    # Get configuration
+
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key or api_key == "your_groq_api_key_here":
         print("  ⚠️  GROQ_API_KEY not configured")
         return []
-    
-    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
-    fallback_models_str = os.getenv("GROQ_FALLBACK_MODELS", "openai/gpt-oss-120b,groq/compound")
-    fallback_models = [m.strip() for m in fallback_models_str.split(",") if m.strip()]
-    
-    # Build detailed context with speaker labels from diarization
-    context_lines = []
-    for i, seg in enumerate(segments):
-        speaker_label = seg.get("speaker", "UNKNOWN")
-        current_role = seg["role"]
-        text = seg["text"]
-        context_lines.append(f"{i}: [Speaker: {speaker_label}, Role: {current_role}] {text}")
-    
-    context = "\n".join(context_lines)
-    
-    prompt = f"""You are an expert at analyzing doctor-patient clinical conversations. You will receive a transcript with automatic speaker diarization and role assignments that may contain errors.
 
-Your task: Review the conversation and return a JSON object with a "roles" array containing {len(segments)} corrected role labels ("Doctor" or "Patient"), one for each line in order.
+    # Build compact context — just index, role, and text (no speaker labels)
+    lines = []
+    for i, seg in enumerate(segments):
+        lines.append(f'{i}|{seg["role"]}|{seg["text"][:120]}')
+    context = "\n".join(lines)
+
+    prompt = f"""You are a clinical conversation analyst. Fix Doctor/Patient role assignments.
+
+Format: index|CurrentRole|text
+Return JSON: {{"roles": ["Doctor","Patient",...]}} with exactly {len(segments)} labels.
 
 Rules:
-1. The first speaker in a clinical conversation is typically the doctor greeting the patient
-2. A patient would NOT say "Good morning, what's the problem?" - that's the doctor
-3. A patient would NOT give medical instructions or prescribe medicine - that's the doctor  
-4. A doctor would NOT say "Thank you, doctor" - that's the patient
-5. Natural turn-taking: roles should alternate in most conversations
-6. Consider the semantic meaning of each utterance, not just the diarization labels
-7. If diarization is correct, keep the original role
+- Doctor greets first ("Good morning", "How can I help")
+- Doctor asks diagnostic questions, gives instructions, prescribes
+- Patient describes symptoms, answers questions, says "thank you doctor"
+- Roles should alternate naturally
 
-Transcript with diarization ({len(segments)} lines):
+Transcript ({len(segments)} lines):
 {context}
 
-IMPORTANT: Return ONLY a valid JSON object. Do not include any explanation or markdown. The object must have exactly {len(segments)} role labels.
+Return ONLY the JSON object, no explanation."""
 
-Required format:
-{{"roles": ["Doctor", "Patient", "Doctor", ...]}}"""
-    
+    models_to_try = [_PRIMARY_MODEL] + _FALLBACK_MODELS
+
     client = Groq(api_key=api_key)
-    
-    # Try primary model first, then fallbacks
-    models_to_try = [model] + fallback_models
-    
-    for attempt_model in models_to_try:
+
+    for model in models_to_try:
         try:
-            # Check if prompt might be too long
-            prompt_tokens_estimate = len(prompt) / 4  # Rough estimate
-            if prompt_tokens_estimate > 3000:
-                print(f"  ⚠️  Warning: Large prompt ({prompt_tokens_estimate:.0f} tokens est.) may exceed limits for {attempt_model}")
-            
-            print(f"  Trying model: {attempt_model}")
-            
+            print(f"  Trying model: {model}")
+
             response = client.chat.completions.create(
-                model=attempt_model,
+                model=model,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert clinical conversation analyst. You must return a valid JSON object with a 'roles' array containing role labels."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "system",
+                     "content": "Return only valid JSON with a 'roles' array."},
+                    {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
-                max_tokens=1000,
-                response_format={"type": "json_object"}  # Enable strict JSON mode
+                max_tokens=max(512, len(segments) * 12),
+                response_format={"type": "json_object"}
             )
-            
-            # Log raw response for debugging
+
             content = response.choices[0].message.content
-            finish_reason = response.choices[0].finish_reason
-            
-            print(f"  Model {attempt_model} finish_reason: {finish_reason}")
-            
-            if not content or content.strip() == "":
-                print(f"  ⚠️  Model {attempt_model} returned empty content")
-                print(f"    Full response object: {response.model_dump_json()}")
+            if not content or not content.strip():
+                print(f"  ✗ {model}: empty response")
                 continue
-            
+
             content = content.strip()
-            print(f"  Model {attempt_model} raw response preview: {content[:150]}...")
-            
-            # Parse JSON object with tolerant parsing
-            try:
-                parsed = json.loads(content)
-            except json.JSONDecodeError as e:
-                print(f"  ⚠️  Model {attempt_model} JSON parse error: {e}")
-                print(f"    Raw content (first 500 chars): {content[:500]}")
-                # Try to extract JSON from markdown fences
-                if "```" in content:
-                    parts = content.split("```")
-                    for part in parts:
-                        part = part.strip()
-                        if part.startswith("json"):
-                            part = part[4:].strip()
-                        if part.startswith("{"):
-                            try:
-                                parsed = json.loads(part)
-                                print(f"  ✓ Extracted JSON from markdown fence")
-                                break
-                            except:
-                                continue
-                    else:
-                        print(f"  ✗ Could not extract valid JSON from markdown")
-                        continue
-                else:
-                    continue
-            
-            # Extract roles array from object
-            if not isinstance(parsed, dict):
-                print(f"  ✗ Model {attempt_model} returned non-object: {type(parsed)}")
-                print(f"    Content: {parsed}")
-                continue
-            
-            # Look for roles array
-            roles = None
-            if "roles" in parsed:
-                roles = parsed["roles"]
-            else:
-                # Try common alternate keys
-                alternate_keys = ["labels", "result", "data", "output", "classifications", "predictions"]
-                for key in alternate_keys:
-                    if key in parsed and isinstance(parsed[key], list):
-                        roles = parsed[key]
-                        print(f"  ℹ️  Found roles in alternate key: '{key}'")
+
+            # Strip markdown fences if present
+            if "```" in content:
+                for part in content.split("```"):
+                    part = part.strip().lstrip("json").strip()
+                    if part.startswith("{"):
+                        content = part
                         break
-            
-            if roles is None:
-                print(f"  ✗ Model {attempt_model} missing 'roles' key")
-                print(f"    Available keys: {list(parsed.keys())}")
-                print(f"    Full parsed object: {parsed}")
+
+            parsed = json.loads(content)
+
+            # Find roles array — try multiple key names
+            roles = None
+            for key in ["roles", "labels", "result", "data", "output"]:
+                if key in parsed and isinstance(parsed[key], list):
+                    roles = parsed[key]
+                    break
+
+            if roles is None or len(roles) != len(segments):
+                print(f"  ✗ {model}: expected {len(segments)} roles, got "
+                      f"{len(roles) if roles else 'None'}")
                 continue
-            
-            if not isinstance(roles, list):
-                print(f"  ✗ Model {attempt_model} 'roles' is not a list: {type(roles)}")
+
+            # Normalise role strings (handle "doctor", "DOCTOR", "Doctor")
+            normalised = []
+            for r in roles:
+                r_str = str(r).strip().lower()
+                if r_str in ("doctor", "dr", "physician"):
+                    normalised.append("Doctor")
+                elif r_str in ("patient", "pt"):
+                    normalised.append("Patient")
+                else:
+                    normalised.append(r)  # will fail validation below
+
+            invalid = [r for r in normalised if r not in ("Doctor", "Patient")]
+            if invalid:
+                print(f"  ✗ {model}: invalid roles {invalid[:3]}")
                 continue
-            
-            if len(roles) != len(segments):
-                print(f"  ✗ Model {attempt_model} returned {len(roles)} roles, expected {len(segments)}")
-                print(f"    Roles received: {roles}")
-                continue
-            
-            # Validate all roles
-            valid_roles = {"Doctor", "Patient"}
-            invalid_roles = [r for r in roles if r not in valid_roles]
-            if invalid_roles:
-                print(f"  ✗ Model {attempt_model} returned invalid roles: {invalid_roles}")
-                print(f"    All roles: {roles}")
-                continue
-            
-            print(f"  ✓ LLM refinement successful with model: {attempt_model}")
-            return roles
-            
+
+            print(f"  ✓ LLM success with {model}")
+            return normalised
+
         except Exception as e:
-            print(f"  ✗ Model {attempt_model} error: {type(e).__name__}: {e}")
-            
-            # Show more details for certain error types
-            if hasattr(e, 'response'):
-                print(f"    Response status: {getattr(e.response, 'status_code', 'N/A')}")
-                print(f"    Response body: {getattr(e.response, 'text', 'N/A')[:200]}")
-            
-            if attempt_model == models_to_try[-1]:
-                print(f"  ✗ All {len(models_to_try)} model(s) failed")
-                return []
-            
-            print(f"  → Trying next fallback model...")
+            print(f"  ✗ {model}: {type(e).__name__}: {str(e)[:120]}")
+            if hasattr(e, "response"):
+                print(f"    HTTP {getattr(e.response, 'status_code', '?')}: "
+                      f"{getattr(e.response, 'text', '')[:150]}")
             continue
-    
+
+    print("  ✗ All models failed")
     return []
 
 
 def validate_groq_config() -> str:
-    """
-    Validate Groq configuration at startup.
-    
-    Returns:
-        Warning message if validation fails, empty string if OK
-    """
+    """Validate Groq config at startup. Returns warning string or empty string."""
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key or api_key == "your_groq_api_key_here":
-        return ""  # Not configured, skip validation
-    
-    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
-    
+        return ""
+
     try:
         from groq import Groq
-        
         client = Groq(api_key=api_key)
-        
-        # List available models
         models_response = client.models.list()
-        available_model_ids = [m.id for m in models_response.data]
-        
-        if model not in available_model_ids:
-            available_str = ", ".join(available_model_ids[:5])
-            return f"⚠️  Configured GROQ_MODEL '{model}' not in available models. Available: {available_str}"
-        
-        print(f"✓ Groq LLM configured: {model}")
-        return ""
-        
+        available = [m.id for m in models_response.data]
+
+        if _PRIMARY_MODEL in available:
+            print(f"✓ Groq configured — primary model: {_PRIMARY_MODEL}")
+            return ""
+        else:
+            return (f"⚠️  Primary model '{_PRIMARY_MODEL}' not found. "
+                    f"Available: {', '.join(available[:5])}")
     except Exception as e:
         return f"⚠️  Groq validation error: {e}"

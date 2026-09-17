@@ -353,8 +353,11 @@
                 document.getElementById('startBtn').classList.remove('hidden');
                 document.getElementById('loading').classList.add('hidden');
 
+                // consultation_id is the session identifier in the new format
+                const sessionId = data.transcript.consultation_id || data.transcript.session_id;
+
                 // Show success popup with link to transcript viewer
-                showSuccessPopup(data.transcript.output_file, data.transcript.session_id);
+                showSuccessPopup(data.transcript.output_file, sessionId);
 
                 // Display transcript
                 displayTranscript(data.transcript);
@@ -397,20 +400,24 @@
             const container = document.getElementById('transcriptContainer');
             container.classList.remove('hidden');
 
-            const duration = transcript.metadata.total_duration;
+            const duration = transcript.metadata ? transcript.metadata.total_duration : (transcript.duration || 0);
             const minutes = Math.floor(duration / 60);
             const seconds = Math.floor(duration % 60);
+
+            // support both consultation_id (new) and session_id (old)
+            const sessionId = transcript.consultation_id || transcript.session_id || 'N/A';
+            const totalSegments = transcript.metadata ? transcript.metadata.total_segments : transcript.segments.length;
 
             let html = `
                 <div class="transcript-header">
                     <h2>📝 Transcript</h2>
-                    <div class="file-location">${transcript.output_file}</div>
+                    <div class="file-location">${transcript.output_file || ''}</div>
                 </div>
 
                 <div class="metadata">
                     <div class="metadata-item">
                         <div class="metadata-label">Session ID</div>
-                        <div class="metadata-value">${transcript.session_id}</div>
+                        <div class="metadata-value">${sessionId}</div>
                     </div>
                     <div class="metadata-item">
                         <div class="metadata-label">Duration</div>
@@ -418,7 +425,7 @@
                     </div>
                     <div class="metadata-item">
                         <div class="metadata-label">Segments</div>
-                        <div class="metadata-value">${transcript.metadata.total_segments}</div>
+                        <div class="metadata-value">${totalSegments}</div>
                     </div>
                 </div>
 
@@ -426,15 +433,21 @@
             `;
 
             transcript.segments.forEach(segment => {
-                const startMin = Math.floor(segment.start / 60);
-                const startSec = Math.floor(segment.start % 60);
-                const endMin = Math.floor(segment.end / 60);
-                const endSec = Math.floor(segment.end % 60);
+                // support both start_time/end_time (new) and start/end (old)
+                const startSec = segment.start_time !== undefined ? segment.start_time : (segment.start || 0);
+                const endSec   = segment.end_time   !== undefined ? segment.end_time   : (segment.end   || 0);
+
+                const startMin = Math.floor(startSec / 60);
+                const startS   = Math.floor(startSec % 60);
+                const endMin   = Math.floor(endSec / 60);
+                const endS     = Math.floor(endSec % 60);
+
+                const speakerLabel = segment.speaker || segment.role || 'UNKNOWN';
 
                 html += `
                     <div class="transcript-segment">
-                        <div class="timestamp">${startMin}:${startSec.toString().padStart(2, '0')} - ${endMin}:${endSec.toString().padStart(2, '0')}</div>
-                        <div class="speaker">${segment.speaker}</div>
+                        <div class="timestamp">${startMin}:${startS.toString().padStart(2, '0')} - ${endMin}:${endS.toString().padStart(2, '0')}</div>
+                        <div class="speaker">${speakerLabel}</div>
                         <div class="text">${segment.text}</div>
                     </div>
                 `;
